@@ -30,10 +30,13 @@ function getDependencyCacheKey(cwd: string, dependencyName: string) {
 // hooks during dev serving, so cache results for the process lifetime the
 // same way hasPackageDependency already does above.
 const installedPackageJsonCache = new Map<string, InstalledPackageJson | undefined>();
-// Keyed by project and package name, so subpath lookups share one walk and one warning.
+// Keyed by project and package name, so subpath lookups share one indexed result and one warning.
 const dependentsLookupCache = new Map<string, InstalledPackageJson | undefined>();
-// Per project: every name installed under some package the dependents walk can reach.
-const reachableDependencyNames = new Map<string, Set<string>>();
+type DependentCandidate = { copy: InstalledPackageJson; via: string };
+type DependentsIndex = Map<string, DependentCandidate[]>;
+// The dependent graph is shared by all package lookups for one project. Building it once avoids
+// walking the same pnpm tree once per transitive dependency name.
+const dependentsIndexCache = new Map<string, DependentsIndex>();
 
 export function setPackageDetectionCwd(cwd: string) {
   packageDetectionCwd = cwd;
@@ -749,30 +752,23 @@ function findPackageInDependents(
 ): InstalledPackageJson | undefined {
   const cacheKey = `${cwd}\0${packageName}`;
   if (!dependentsLookupCache.has(cacheKey)) {
-    // A walk for a name no reachable package installs visits the whole graph,
-    // so check one shared index first instead of repeating that walk per name.
-    if (!reachableDependencyNames.has(cwd)) {
-      const names = new Set<string>();
-      walkDependents('', cwd, names);
-      reachableDependencyNames.set(cwd, names);
-    }
-    dependentsLookupCache.set(
-      cacheKey,
-      reachableDependencyNames.get(cwd)!.has(packageName)
-        ? walkDependents(packageName, cwd)
-        : undefined
-    );
+    const candidates = getDependentsIndex(cwd).get(packageName);
+    if (candidates) warnOnAmbiguousDependents(packageName, candidates);
+    dependentsLookupCache.set(cacheKey, candidates?.[0]?.copy);
   }
   return dependentsLookupCache.get(cacheKey);
 }
 
-function walkDependents(
-  packageName: string,
-  cwd: string,
-  reachedNames?: Set<string>
-): InstalledPackageJson | undefined {
+function getDependentsIndex(cwd: string): DependentsIndex {
+  const cached = dependentsIndexCache.get(cwd);
+  if (cached) return cached;
+
   const root = tryReadPackageJson(path.join(cwd, 'package.json'));
-  if (!root) return undefined;
+  const index: DependentsIndex = new Map();
+  if (!root) {
+    dependentsIndexCache.set(cwd, index);
+    return index;
+  }
 
   // Keyed by the real package directory, not the name: two branches can carry
   // two versions of the same package, and only one of them may declare the target.
@@ -787,41 +783,40 @@ function walkDependents(
   for (const rootDependencies of rootDependencyGroups) {
     let level = rootDependencies.map((name) => ({ name, fromDir: cwd }));
     while (level.length) {
-      const candidates: { copy: InstalledPackageJson; via: string }[] = [];
+      const candidatesByName = new Map<string, DependentCandidate[]>();
       const nextLevel: typeof level = [];
       for (const { name, fromDir } of level) {
-        if (name === packageName) continue;
         const dependent = findPackageFrom(name, fromDir);
         if (!dependent || visited.has(dependent.dir)) continue;
         visited.add(dependent.dir);
-        reachedNames?.add(name);
         const dependencies = getDependencyNames(dependent.packageJson);
         // Only a declared edge is followed. Node resolution from a package that
         // merely sits near the target walks up into a hoisted copy, which is the
         // arbitrary pick this walk exists to avoid.
-        if (dependencies.includes(packageName)) {
-          const copy = findPackageFrom(packageName, dependent.dir);
-          if (copy) candidates.push({ copy, via: name });
-        }
         for (const dependency of dependencies) {
+          const copy = findPackageFrom(dependency, dependent.dir);
+          if (copy) {
+            const candidates = candidatesByName.get(dependency) ?? [];
+            candidates.push({ copy, via: name });
+            candidatesByName.set(dependency, candidates);
+          }
           nextLevel.push({ name: dependency, fromDir: dependent.dir });
         }
       }
-      if (candidates.length) {
-        warnOnAmbiguousDependents(packageName, candidates);
-        return candidates[0].copy;
+      // The first level that discovers a package is the closest dependent level
+      // for that package. Keep all candidates in that level for ambiguity warnings.
+      for (const [name, candidates] of candidatesByName) {
+        if (!index.has(name)) index.set(name, candidates);
       }
       level = nextLevel;
     }
   }
 
-  return undefined;
+  dependentsIndexCache.set(cwd, index);
+  return index;
 }
 
-function warnOnAmbiguousDependents(
-  packageName: string,
-  candidates: { copy: InstalledPackageJson; via: string }[]
-) {
+function warnOnAmbiguousDependents(packageName: string, candidates: DependentCandidate[]) {
   const viaByVersion = new Map<unknown, string>();
   for (const { copy, via } of candidates) {
     if (!viaByVersion.has(copy.packageJson.version)) {

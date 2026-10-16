@@ -559,6 +559,35 @@ describe('getInstalledPackageJson through dependents', () => {
     );
   });
 
+  it('reuses one dependent index for different missing package names', () => {
+    const { root, writePackage, installShared } = createProject({
+      dependencies: { 'mf-test-parent': '1.0.0' },
+    });
+    writePackage('node_modules/mf-test-parent', {
+      name: 'mf-test-parent',
+      dependencies: {
+        'mf-test-shared': '1.0.0',
+        'mf-test-sibling': '1.0.0',
+      },
+    });
+    installShared('node_modules/mf-test-parent', '1.0.0');
+    writePackage('node_modules/mf-test-parent/node_modules/mf-test-sibling', {
+      name: 'mf-test-sibling',
+      version: '1.0.0',
+    });
+
+    expect(getInstalledPackageJson('mf-test-shared', { cwd: root })?.packageJson.version).toBe(
+      '1.0.0'
+    );
+
+    // The second lookup must use the index built by the first lookup instead of
+    // walking the dependent tree again.
+    rmSync(path.join(root, 'node_modules/mf-test-parent'), { recursive: true, force: true });
+    expect(getInstalledPackageJson('mf-test-sibling', { cwd: root })?.packageJson.version).toBe(
+      '1.0.0'
+    );
+  });
+
   it('terminates on a dependency cycle', () => {
     const { root, writePackage } = createProject({ dependencies: { 'mf-test-a': '1.0.0' } });
     writePackage('node_modules/mf-test-a', {
